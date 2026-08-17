@@ -1,11 +1,14 @@
 package com.blog.example.license;
 
+import com.blog.example.state.LicenseState;
+
 import java.time.LocalDate;
 import java.util.Collections;
-import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 // Singleton that centralises all license state for the application.
 // Uses the "Bill Pugh" holder idiom for lazy, thread-safe initialisation
@@ -15,12 +18,14 @@ public final class LicenseManager {
     // --- Singleton mechanics (Bill Pugh holder) ---
 
     private LicenseManager() {
-        // private constructor prevents external instantiation
-        this.unlockedFeatures = new LinkedHashSet<>();
-        this.moduleHitCount   = new LinkedHashMap<>();
-        this.activationDate   = null;
-        this.licenseKey       = null;
-        this.tier             = LicenseTier.NONE;
+        this.licenseState = new LicenseState(
+                null,
+                LicenseTier.NONE,
+                null,
+                Set.of()
+        );
+
+        this.moduleHitCount = new ConcurrentHashMap<>();
     }
 
     // The inner static class is loaded only when getInstance() is first called.
@@ -40,11 +45,19 @@ public final class LicenseManager {
 
     // --- State ---
 
-    private String licenseKey;
-    private LicenseTier tier;
-    private LocalDate activationDate;
-    private final Set<String> unlockedFeatures;
-    private final Map<String, Integer> moduleHitCount;
+    /*
+     * The complete license state is replaced atomically when the license
+     * is activated. The state itself is immutable.
+     */
+    private volatile LicenseState licenseState;
+
+    /*
+     * ConcurrentHashMap allows multiple threads to update different
+     * modules concurrently.
+     *
+     * AtomicInteger guarantees that increments are atomic.
+     */
+    private final Map<String, AtomicInteger> moduleHitCount;
 
     // --- Public API ---
 
@@ -56,62 +69,108 @@ public final class LicenseManager {
      */
     public void activateLicense(String key) {
         if (key == null || key.isBlank()) {
-            throw new IllegalArgumentException("License key must not be blank");
+            throw new IllegalArgumentException(
+                    "License key must not be blank"
+            );
         }
-        this.licenseKey     = key;
-        this.activationDate = LocalDate.now();
 
         String upper = key.toUpperCase();
+
+        LicenseTier newTier;
+
         if (upper.contains("ENT")) {
-            this.tier = LicenseTier.ENTERPRISE;
+            newTier = LicenseTier.ENTERPRISE;
         } else if (upper.contains("PRO")) {
-            this.tier = LicenseTier.PRO;
+            newTier = LicenseTier.PRO;
         } else {
-            this.tier = LicenseTier.BASIC;
+            newTier = LicenseTier.BASIC;
         }
 
-        // Unlock features according to tier (cumulative)
-        unlockedFeatures.clear();
-        unlockedFeatures.add("REPORTING");
-        if (tier.ordinal() >= LicenseTier.PRO.ordinal()) {
-            unlockedFeatures.add("ADVANCED_ANALYTICS");
-            unlockedFeatures.add("REAL_TIME_SYNC");
-        }
-        if (tier == LicenseTier.ENTERPRISE) {
-            unlockedFeatures.add("AI_PREDICTIONS");
-            unlockedFeatures.add("MULTI_TENANT");
+        // Build the complete feature set before publishing the new state.
+        Set<String> features = new LinkedHashSet<>();
+
+        features.add("REPORTING");
+
+        if (newTier == LicenseTier.PRO
+                || newTier == LicenseTier.ENTERPRISE) {
+
+            features.add("ADVANCED_ANALYTICS");
+            features.add("REAL_TIME_SYNC");
         }
 
-        System.out.println("License activated  -> key=" + licenseKey
-                + "  tier=" + tier
-                + "  features=" + unlockedFeatures);
+        if (newTier == LicenseTier.ENTERPRISE) {
+            features.add("AI_PREDICTIONS");
+            features.add("MULTI_TENANT");
+        }
+
+        // Make the Set immutable before publishing it.
+        Set<String> immutableFeatures =
+                Collections.unmodifiableSet(features);
+
+        /*
+         * Create the complete state first.
+         *
+         * Because licenseState is volatile, publishing this reference
+         * makes the complete state visible to other threads.
+         */
+
+        this.licenseState = new LicenseState(
+                key,
+                newTier,
+                LocalDate.now(),
+                immutableFeatures
+        );
+
+        System.out.println(
+                "License activated -> tier="
+                        + newTier
+                        + " features="
+                        + immutableFeatures
+        );
     }
 
-    /** Returns true when the named feature is unlocked by the current license. */
+    /**
+     * Returns true when the named feature is unlocked
+     * by the current license.
+     */
     public boolean isFeatureUnlocked(String featureName) {
-        return unlockedFeatures.contains(featureName);
+        return licenseState.unlockedFeatures()
+                .contains(featureName);
     }
 
-    /** Increments the hit counter for a given module. */
+    /**
+     * Increments the hit counter for a given module.
+     */
     public void recordHit(String moduleName) {
-        moduleHitCount.merge(moduleName, 1, Integer::sum);
+
+        moduleHitCount
+                .computeIfAbsent(
+                        moduleName,
+                        key -> new AtomicInteger()
+                )
+                .incrementAndGet();
     }
 
     public LicenseTier getTier() {
-        return tier;
+        return licenseState.tier();
     }
 
     public Set<String> getUnlockedFeatures() {
-        return Collections.unmodifiableSet(unlockedFeatures);
+        return licenseState.unlockedFeatures();
     }
 
-    /** Prints a human-readable summary of the current license state. */
+    /**
+     * Prints a human-readable summary of the current license state.
+     */
     public void printLicenseSummary() {
+
+        LicenseState state = licenseState;
+
         System.out.println("--- License Summary ---");
-        System.out.println("Key             : " + (licenseKey != null ? licenseKey : "(none)"));
-        System.out.println("Tier            : " + tier);
-        System.out.println("Activated on    : " + (activationDate != null ? activationDate : "N/A"));
-        System.out.println("Features        : " + unlockedFeatures);
+        System.out.println("Key             : " + (state.licenseKey() != null ? state.licenseKey() : "(none)"));
+        System.out.println("Tier            : " + state.tier());
+        System.out.println("Activated on    : " + (state.activationDate() != null ? state.activationDate() : "N/A"));
+        System.out.println("Features        : " + getUnlockedFeatures());
         System.out.println("Module hit map  : " + moduleHitCount);
         System.out.println("-----------------------");
     }
